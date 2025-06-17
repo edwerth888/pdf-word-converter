@@ -1,25 +1,73 @@
 import os
 import uuid
+import time
+import threading
 import fitz  # PyMuPDF
 from docx import Document
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 
 # --- Configuration ---
 UPLOAD_FOLDER = 'uploads'
-MAX_FILE_SIZE = 30 * 1024 * 1024 # 30 MB
+LOG_FOLDER = 'logs'
+MAX_FILE_SIZE = 30 * 1024 * 1024
+CLEANUP_DELAY_SECONDS = 300 # 5 นาที
 
 # --- App Initialization ---
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['LOG_FOLDER'] = LOG_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 CORS(app)
 
 # --- สร้างโฟลเดอร์ที่จำเป็น ---
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
+for folder in [UPLOAD_FOLDER, LOG_FOLDER]:
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+# --- Helper Classes & Functions ---
+class LogStreamer:
+    """คลาสสำหรับช่วยเขียน Log ลงไฟล์ และอ่านเพื่อส่งให้ Client"""
+    def __init__(self, task_id):
+        self.log_file_path = os.path.join(app.config['LOG_FOLDER'], f"{task_id}.log")
+        with open(self.log_file_path, 'w', encoding='utf-8') as f:
+            f.write('')
+
+    def log(self, message):
+        timestamp = time.strftime('%H:%M:%S')
+        with open(self.log_file_path, 'a', encoding='utf-8') as f:
+            f.write(f"[{timestamp}] {message}\n")
+        print(f"Logged for {self.log_file_path}: {message}")
+
+    def stream(self):
+        last_pos = 0
+        while True:
+            with open(self.log_file_path, 'r', encoding='utf-8') as f:
+                f.seek(last_pos)
+                new_lines = f.readlines()
+                last_pos = f.tell()
+                for line in new_lines:
+                    line = line.strip()
+                    if line:
+                        yield f"data: {line}\n\n"
+                if "PROCESS_COMPLETE" in " ".join(new_lines):
+                    yield f"data: [DONE]\n\n"
+                    break
+            time.sleep(0.5)
+
+def cleanup_files(paths_to_delete):
+    def task():
+        time.sleep(CLEANUP_DELAY_SECONDS)
+        for path in paths_to_delete:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                print(f"Error during cleanup of {path}: {e}")
+    thread = threading.Thread(target=task)
+    thread.start()
 
 # --- Error Handlers ---
 @app.errorhandler(413)
@@ -27,82 +75,92 @@ if not os.path.exists(UPLOAD_FOLDER):
 def handle_file_too_large(e):
     return jsonify({"error": f"File is too large. Maximum size is {MAX_FILE_SIZE / 1024 / 1024:.0f} MB."}), 413
 
-# --- API Endpoint ---
+# --- API Endpoints ---
 @app.route('/api/convert', methods=['POST'])
 def handle_conversion():
     if 'file' not in request.files:
         return jsonify({"error": "No file part in the request"}), 400
-    
     file = request.files['file']
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
-
-    conversion_type = request.form.get('type')
     
-    # --- PDF to Word Conversion ---
+    conversion_type = request.form.get('type')
+    task_id = str(uuid.uuid4())
+    logger = LogStreamer(task_id)
+
     if conversion_type == 'pdf-to-word':
+        original_filename = secure_filename(file.filename)
+        input_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{task_id}.pdf")
+        
+        # ใช้ชื่อไฟล์ output ที่เราสร้าง (_sandbox)
+        base_name = os.path.splitext(original_filename)[0]
+        output_filename_user = f"{base_name}_sandbox.docx"
+        output_filename_server = f"{task_id}.docx"
+        output_path = os.path.join(app.config['UPLOAD_FOLDER'], output_filename_server)
+
         try:
-            # 1. Save uploaded file
-            pdf_filename = secure_filename(file.filename)
-            input_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{uuid.uuid4()}_{pdf_filename}")
             file.save(input_path)
+            logger.log(f"File '{original_filename}' received. Task ID: {task_id}")
+            logger.log("Initializing conversion engine (PyMuPDF)...")
             
-            # 2. Open PDF with PyMuPDF
             pdf_document = fitz.open(input_path)
-            
-            # 3. Create a new Word document
             word_document = Document()
             
-            # 4. Extract text and add to Word document
-            for page_num in range(len(pdf_document)):
-                page = pdf_document.load_page(page_num)
-                # ใช้ get_text("text") เพื่อความเรียบง่ายและเสถียร
+            logger.log(f"PDF contains {len(pdf_document)} pages. Starting text extraction...")
+            
+            for i, page in enumerate(pdf_document):
                 text = page.get_text("text")
                 word_document.add_paragraph(text)
-                if page_num < len(pdf_document) - 1:
-                    word_document.add_page_break() # เพิ่มตัวแบ่งหน้า
-            
-            # 5. Save the Word document
-            base_name = os.path.splitext(pdf_filename)[0]
-            output_filename = f"{base_name}_converted.docx"
-            output_path = os.path.join(app.config['UPLOAD_FOLDER'], output_filename)
-            word_document.save(output_path)
-            
-            pdf_document.close()
-            os.remove(input_path) # ลบไฟล์ pdf ที่อัปโหลดทิ้ง
+                word_document.add_page_break()
+                logger.log(f"-> Extracted text from page {i+1}/{len(pdf_document)}")
 
-            # ส่งลิงก์สำหรับดาวน์โหลดกลับไป (แบบง่าย)
+            logger.log("Assembling Word document...")
+            word_document.save(output_path)
+            pdf_document.close()
+            
+            logger.log("Conversion complete!")
+            logger.log(f"Output file ready: {output_filename_user}")
+            logger.log("PROCESS_COMPLETE")
+
+            download_url = f"/api/download/{output_filename_server}?filename={output_filename_user}"
             return jsonify({
-                "message": "Conversion successful!",
-                # เราจะส่งไฟล์โดยตรงแทนการสร้างลิงก์ที่ซับซ้อน
-                "download_path": f"/api/download/{output_filename}"
+                "message": "Processing started.",
+                "log_stream_url": f"/api/stream-logs/{task_id}",
+                "download_url": download_url
             })
 
         except Exception as e:
-            print(f"An error occurred during PDF-to-Word conversion: {e}")
-            return jsonify({"error": "Failed to convert PDF to Word. The file might be corrupted or in an unsupported format."}), 500
-    
-    # --- Word to PDF (Temporarily Disabled) ---
-    elif conversion_type == 'word-to-pdf':
-        return jsonify({
-            "error": "Word to PDF conversion is temporarily disabled due to server environment limitations. This feature is under development."
-        }), 501 # 501 Not Implemented
-        
-    else:
-        return jsonify({"error": "Invalid conversion type specified."}), 400
+            error_message = f"ERROR: {str(e)}"
+            logger.log(error_message)
+            logger.log("PROCESS_COMPLETE")
+            print(error_message)
+            return jsonify({"error": "An internal error occurred."}), 500
+        finally:
+             cleanup_files([input_path, output_path, os.path.join(app.config['LOG_FOLDER'], f"{task_id}.log")])
 
-# --- Download Endpoint ---
-@app.route('/api/download/<filename>')
-def download_file(filename):
-    try:
-        # ส่งไฟล์ให้ผู้ใช้ดาวน์โหลดแล้วลบไฟล์นั้นทิ้งจากเซิร์ฟเวอร์
-        return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
-    except FileNotFoundError:
-        return jsonify({"error": "File not found or has been deleted."}), 404
+    elif conversion_type == 'word-to-pdf':
+         return jsonify({"error": "Word to PDF conversion is temporarily disabled."}), 501
+    
+    return jsonify({"error": "Invalid conversion type."}), 400
+
+@app.route('/api/stream-logs/<task_id>')
+def stream_logs(task_id):
+    logger = LogStreamer(task_id)
+    return Response(logger.stream(), mimetype='text/event-stream')
+
+@app.route('/api/download/<server_filename>')
+def download_file(server_filename):
+    display_filename = request.args.get('filename', 'converted_file_sandbox.docx')
+    return send_from_directory(
+        app.config['UPLOAD_FOLDER'],
+        server_filename,
+        as_attachment=True,
+        download_name=display_filename
+    )
 
 @app.route('/')
 def index():
-    return "File Conversion API (Self-Hosted, Revised) is running!"
+    return "File Conversion API (Self-Hosted, SSE) is running!"
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5000, threaded=True)
