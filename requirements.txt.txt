@@ -1,0 +1,5 @@
+Flask
+Flask-Cors
+gunicorn
+pdf2docx
+docx2pdf
